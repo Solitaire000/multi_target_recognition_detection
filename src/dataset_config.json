@@ -1,0 +1,84 @@
+{
+    "IMAGE_SIZE": 640,
+    "NUM_PROBE_KEYPOINTS": 16,
+    "dataset": {
+        "DATASET_CATEGORY_ID": {
+            "PROBE_G1": 0,
+            "PROBE_S": 1,
+            "PROBE_G2": 2,
+            "PROBE_GSG": 3,
+            "PROBE_KEYPOINTS": 4,
+            "LOAD": 10,
+            "OPEN": 11,
+            "SHORT": 12,
+            "THRU": 13
+        },
+        "DATASET_CATEGORY_NAME": {
+            "0": "PROBE_G1",
+            "1": "PROBE_S",
+            "2": "PROBE_G2",
+            "3": "PROBE_GSG",
+            "4": "PROBE_KEYPOINTS",
+            "10": "LOAD",
+            "11": "OPEN",
+            "12": "SHORT",
+            "13": "THRU"
+        }
+    },
+    "probe": {
+        "PROBE_CATEGORY_NAMES": [
+            "PROBE_GSG",
+            "PROBE_G2"
+        ],
+        "PROBE_CATEGORY_IDS": [
+            3,
+            2
+        ],
+        "PROBE_CATEGORY_ID_TO_LABEL": {
+            "3": 0,
+            "2": 1
+        },
+        "PROBE_LABEL_TO_CATEGORY_ID": {
+            "0": 3,
+            "1": 2
+        },
+        "PROBE_LABEL_NAMES": [
+            "probe_gsg",
+            "probe_g2"
+        ],
+        "NUM_PROBE_CLASSES": 2
+    },
+    "calibration": {
+        "CALIB_CATEGORY_NAMES": [
+            "LOAD",
+            "OPEN",
+            "SHORT",
+            "THRU"
+        ],
+        "CALIB_CATEGORY_IDS": [
+            10,
+            11,
+            12,
+            13
+        ],
+        "CALIB_CATEGORY_ID_TO_LABEL": {
+            "10": 0,
+            "11": 1,
+            "12": 2,
+            "13": 3
+        },
+        "CALIB_LABEL_TO_CATEGORY_ID": {
+            "0": 10,
+            "1": 11,
+            "2": 12,
+            "3": 13
+        },
+        "CALIB_LABEL_NAMES": [
+            "load",
+            "open",
+            "short",
+            "thru"
+        ],
+        "NUM_CALIB_CLASSES": 4
+    }
+}
