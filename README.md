@@ -1,14 +1,13 @@
-[Uploading README.md…]()
-# 物理约束 + LSTM 注意力网络：探针调平角度预测
+# GSGProbeNet：GSG 微波探针多任务视觉检测网络
 
-> 融合接触力学先验知识与深度序列模型，在小样本条件下实现高精度探针调平角度预测。
+> 面向微波探针台精密测试场景的探针关键点定位、校准片识别分类、针痕检测与分组一体化视觉检测系统。
 
 ## 目录
 
 - [项目简介](#项目简介)
-- [方法论](#方法论)
-- [网络结构](#网络结构)
-- [损失函数设计](#损失函数设计)
+- [系统架构](#系统架构)
+- [技术方案详解](#技术方案详解)
+- [训练策略](#训练策略)
 - [实验结果](#实验结果)
 - [目录结构](#目录结构)
 - [技术栈](#技术栈)
@@ -17,108 +16,205 @@
 
 ## 项目简介
 
-GSG 探针在与晶圆/校准片接触建立测试连接的过程中，需要精确控制三爪针尖的调平角度以保证均匀接触。调平过程本质上是一个**接触力学问题**：接触力、电阻、电容、电感等多物理量的时序变化服从明确的物理规律，但受传感器噪声、多因素耦合影响，难以用解析公式精确求解；同时调平实验采集成本高，可用样本量有限，纯数据驱动的深度学习模型容易学到虚假相关性、泛化能力差。
+本项目构建了一套基于深度学习的多任务视觉检测网络 **GSGProbeNet**，在单张图像上同步完成三个任务：
 
-本项目提出"**物理约束 + 机器学习**"的混合建模方案：手工提取接触力学先验特征，与 LSTM + 注意力机制提取的时序特征融合，并在损失函数中显式加入物理规律惩罚项，在小样本条件下将调平角度预测精度提升至 **0.1°**。
+1. **探针检测 + 关键点定位**：定位探针旋转框及针尖等 16 个关键结构点；
+2. **校准片检测 + 分类**：定位校准片并识别其规格/状态；
+3. **针痕检测 + 分组**：检测探针接触后留下的针痕点，并将同一次下压产生的 G-S-G 三点正确归为一组。
 
-## 核心特性
-
-- ✅ **手工物理特征工程**：基于接触力学理论提取最大接触力、力信号斜率、电阻突变点、接触刚度、电容变化率等先验特征；
-- ✅ **LSTM + 注意力时序建模**：门控机制缓解梯度消失，注意力加权聚合各时间步隐藏状态，避免固定使用序列末端输出丢失中段关键信息；
-- ✅ **特征级融合**：数据驱动特征与领域专家先验特征拼接融合，兼顾模式挖掘能力与小样本泛化能力；
-- ✅ **物理约束损失函数**：在 MSE 主损失基础上加入软惩罚项，约束预测结果不违反已知物理规律，起到正则化与可解释性双重作用。
-
-## 方法论
-
-| 建模范式 | 适用条件 | 本场景适配性 |
-|---|---|---|
-| 纯物理机理建模 | 机理完全已知、可精确解析求解 | ✗ 传感器噪声、多因素耦合导致复杂非线性，难以解析求解 |
-| 纯数据驱动黑箱模型 | 数据量充足 | ✗ 调平实验成本高，样本有限，易学到虚假相关性 |
-| **物理约束 + 机器学习**（本项目） | 机理部分已知但难以解析求解，且数据有限 | ✓ 手工特征 + 损失函数约束注入专家先验，弥补小样本泛化短板 |
-
-## 网络结构
+## 系统架构
 
 ```
-时序输入 (force, resistance, inductance, capacitance, displacement)
+输入图像
    │
-   ├──► LSTM ──► 注意力加权求和 ──┐
-   │                              ├──► 特征拼接 ──► 全连接回归头 ──► 调平角度预测
-   └──► 手工物理特征提取 ──────────┘
+   ▼
+HRNetBackbone（多分辨率并行分支）
+   │
+   ▼
+FPN（256通道，输出 P2/P3/P4/P5 四层特征）
+   │
+   ├── probe_det   (RotatedFCOSHead，多尺度)
+   │        │
+   │        ▼ 旋转框 RoI
+   │   ┌─────────────────┬──────────────────┬────────────────────┐
+   │   │ RoIKeypointHead │  ProbeMaskHead    │  ProbeStateHead     │
+   │   │ 16关键点+不确定度 │  实例分割          │ 遮挡率/失焦度/可见比 │
+   │   └─────────────────┴──────────────────┴────────────────────┘
+   │
+   ├── calib_det   (RotatedFCOSHead，多尺度，校准片检测+分类)
+   │
+   └── scrub_head  (ScrubHeatmapHead，单尺度 P2，针痕检测+关联嵌入分组+角色分类)
 ```
 
-**手工物理特征：**
+**设计取舍**：HRNet 相比 ResNet+FPN 计算量更大，但对小目标定位更有优势，适合研发验证阶段追求精度；针痕检测的产线部署版本改用更轻量的 YOLOv8 + OpenCV DNN，兼顾工控机的跨平台部署约束与检测速度。
 
-| 特征 | 计算式 | 物理含义 |
+## 技术方案详解
+
+### 1. 旋转框检测头（RotatedFCOSHead）
+
+Anchor-free 单阶段检测头，在 FCOS 基础上扩展旋转角度回归：
+
+- 分类头偏置先验初始化：
+
+$$
+b_{init}=-\log\left(\frac{1-\pi_0}{\pi_0}\right)\approx-4.6\quad(\pi_0=0.01)
+$$
+
+- 角度回归用 `tanh` 限幅避免周期性跳变：
+
+$$
+\hat\theta=\tanh(\hat d_\theta)\times\frac{\pi}{4}
+$$
+
+- 解码融合分类置信度与中心度：
+
+$$
+score=\sqrt{\mathrm{sigmoid}(cls)\times \mathrm{sigmoid}(ctr)}
+$$
+
+**检测头损失：**
+
+$$
+FL(p_t)=-\alpha_y(1-p_t)^{\gamma}\big[y\log p+(1-y)\log(1-p)\big]
+$$
+
+$$
+L_{bbox}=\mathrm{SmoothL1}(\Delta\hat x,\Delta\hat y)+\mathrm{SmoothL1}(\log\hat w,\log\hat h)
+$$
+
+$$
+L_{angle}=\mathrm{mean}\big(1-\cos(\hat\theta-\theta)\big),\qquad L_{ctr}=\mathrm{BCEWithLogits}(\hat c,t)
+$$
+
+$$
+L_{det}=\frac{\sum_{layer}\Big[L_{cls}^{(sum)}+\sum_{pos}(L_{bbox}+L_{ctr}+L_{angle})\Big]}{\max(N_{pos},1)}
+$$
+
+### 2. 关键点检测头（RoIKeypointHead）
+
+- **soft-argmax** 解码坐标（可导）：
+
+$$
+\mu_{xy}=\mathrm{soft\text{-}argmax}(heatmap;\ \tau=100)
+$$
+
+- 每个关键点额外预测**各向同性高斯不确定度**：
+
+$$
+L_{nll}=\log(\sigma^2)+\frac{\lVert \mu_{xy}^{px}-g_{xy}^{px}\rVert^2}{\sigma^2+\epsilon}
+$$
+
+- 前景加权热图损失：
+
+$$
+w_{fg}=g_{heatmap}\times4.0+1.0,\qquad
+L_{heatmap}=\frac{\sum\big[(p_{heatmap}-g_{heatmap})^2\cdot w_{fg}\cdot m_{vis}\big]}{\sum m_{vis}}
+$$
+
+- 关键点总损失：
+
+$$
+L_{keypoint}^{final}=(L_{heatmap}+0.2\,L_{nll})+0.3\,L_{vis}
+$$
+
+### 3. 多任务不确定性自适应损失加权
+
+$$
+L_{total}=\sum_{i=1}^{5}\left[\frac{1}{2}\exp(-2\log\sigma_i)\cdot L_i+\log\sigma_i\right]
+$$
+
+其中 $i\in\{probe\_det,\ keypoint,\ calib\_det,\ probe\_state,\ scrub\}$，$\sigma_i$ 为每个任务一个可学习标量参数。损失越大、越不稳定的任务会被自动降权（同方差不确定性思路，参见 Kendall & Gal, 2018）。训练前 5 个 epoch 关闭该机制（sigma-warmup），先用固定权重稳定训练。
+
+### 4. 针痕检测与关联嵌入分组
+
+针痕检测的难点不只是"检测出点"，更在于**分组**——一次探针下压会在测试面上留下 G-S-G 三个点，需正确判断三点归属。
+
+**关联嵌入损失：**
+
+$$
+\bar e_g=\frac{1}{|g|}\sum_{i\in g}e_i,\qquad
+L_{pull}=\mathrm{mean}_i\big(\lVert e_i-\bar e_{g(i)}\rVert^2\big)
+$$
+
+$$
+L_{push}=\mathrm{mean}_{g\neq g'}\Big(\exp\big(-0.5\lVert\bar e_g-\bar e_{g'}\rVert^2\big)\Big)
+$$
+
+$$
+L_{scrub\_assoc}=L_{pull}+L_{push}+0.3\,L_{role}
+$$
+
+推理阶段仅用两个**不含可学习参数的纯几何判据**做最终复核（共线性、间距相等性），保证几何硬约束与数据驱动的分组预测相互独立验证。
+
+**磨损评分**：对分组后的针痕做 Kasa 圆拟合评估圆度、Procrustes 形状残差分析，可选马氏距离异常检测（未标定参考样本时自动退化为纯几何评分，避免给出不可信的结论）。
+
+### 5. 实例分割 Mask 头
+
+$$
+L_{mask}=\mathrm{BCEWithLogits}(\hat m,m)+\left(1-\frac{2\sum(pg)+s}{\sum p+\sum g+s}\right)
+$$
+
+## 训练策略
+
+### 数据标签生成：合成扰动自监督标注
+
+探针状态头（遮挡率/失焦度/可见比例）的标签几乎无法人工标注，采用程序化合成扰动生成精确已知的监督信号：
+
+| 标签 | 生成方式 | 精确性保证 |
 |---|---|---|
-| 最大接触力 | $\max(F)$ | 接触压力峰值水平 |
-| 力信号斜率 | $\max(\mathrm{diff}(F))$ | 接触状态突变剧烈程度 |
-| 电阻突变点位置 | $\arg\max\lvert\mathrm{diff}(R)\rvert$ | 稳定电接触建立时刻 |
-| 接触刚度 | $\max\!\left(\dfrac{\mathrm{diff}(F)}{\mathrm{diff}(d)}\right)$ | 接触力学耦合特性 |
-| 电容变化率 | $\max(\mathrm{diff}(C))$ | 接触稳定性敏感度 |
+| 可见比例 | 旋转框角点与画布相交多边形面积 / 自身面积 | 纯几何计算，精确无误差 |
+| 遮挡率 | 仅在真实实例 mask 范围内随机挖 1~3 个矩形洞 | 挖洞面积/mask面积精确已知，避免全图随机挖洞导致的实例归属混淆 |
+| 失焦度 | 仅在实例邻域内做已知 $\sigma$ 的局部高斯模糊 | $\sigma/\sigma_{max}$ 精确已知，与全图噪声增强分工明确 |
 
-**为什么用 LSTM 而非 Transformer/TCN/GRU**：样本量有限、序列较短，Transformer 参数量大、归纳偏置弱，在小样本下容易过拟合；LSTM 在表达能力与数据效率之间取得更好平衡，是"轻量级网络"设计目标下的合理选择。
+### 两阶段迁移学习
 
-## 损失函数设计
+```
+Phase 1（伪标签预训练）  20 epochs, lr=1e-3, AdamW + 余弦退火
+Phase 2（人工标注微调）  10 epochs, 分层学习率
+  backbone : lr × 0.1（冻结前2层）
+  FPN      : lr × 0.5
+  任务头    : lr × 1.0
+sigma_warmup_epochs = 5
+```
 
-主任务损失（MSE）+ 物理约束惩罚项：
+### 训练稳定性工程
 
-$$
-L_{mse}=\frac{1}{N}\sum_{n=1}^{N}(\hat y_n-y_n)^2
-$$
-
-$$
-L_{mono}=\mathrm{mean}\big(\mathrm{ReLU}(-\hat y)\big)
-$$
-
-$$
-L=L_{mse}+\lambda\, L_{mono}
-$$
-
-物理约束项可根据实际先验灵活替换，例如：
-
-- **时序平滑约束**（抑制预测抖动）：
-
-$$
-L_{smooth}=\mathrm{mean}\big((\hat y_t-\hat y_{t-1})^2\big)
-$$
-
-- **范围约束**（角度应落在物理可行区间 $[y_{min},y_{max}]$）：
-
-$$
-L_{range}=\mathrm{mean}\big(\mathrm{ReLU}(\hat y-y_{max})+\mathrm{ReLU}(y_{min}-\hat y)\big)
-$$
-
-- **方向一致性约束**（与接触力变化方向一致）：
-
-$$
-L_{corr}=\mathrm{mean}\Big(\mathrm{ReLU}\big(-\mathrm{sign}(\Delta F)\cdot\mathrm{sign}(\Delta\hat y)\big)\cdot\lvert\Delta\hat y\rvert\Big)
-$$
-
-**设计动机**：小样本条件下，纯数据驱动模型容易过拟合到训练集中偶然存在但不具备物理意义的相关性；物理约束项相当于向模型注入专家先验知识，起到正则化作用，同时提升预测结果的可解释性——若预测违反已知物理规律，本身即是一个可用于工程排查的信号。权重 $\lambda$ 通过验证集调参确定，不宜过大（牺牲对真实数据的拟合能力）也不宜过小（起不到正则化效果），本质上是一次偏差-方差权衡。
+- 混合精度训练（`autocast` + `GradScaler`）；
+- 梯度裁剪：**必须**先 `scaler.unscale_(optimizer)` 反缩放梯度，再做 `clip_grad_norm_`；
+- 断点续训：完整保存优化器/调度器/epoch状态。
 
 ## 实验结果
 
-| 指标 | 结果 |
+| 指标 | 数值 |
 |---|---|
-| 调平角度预测精度 | 0.1° |
+| 探针关键点平均定位误差 | ≤ 5 px |
+| 校准片分类准确率 | 99% |
+| 针痕检测 Precision / Recall / mAP@0.5 | 97.0% / 97.2% / 98.3% |
+| 探针实例分离 Precision（分割+聚类方案，已废弃） | 0.177（细长目标假阳性严重） |
+| 探针实例分离 F1（切换统一 RotatedFCOS 架构后） | 0.973 |
+| 校准片实例分离 F1 | 0.973 |
+
+**关键工程教训**：探针分支最初采用"语义分割 + 偏移向量投票聚类"方案，验证发现细长/密集排布目标的偏移向量投票极易分裂到多个错误候选中心，Precision 仅 0.177；团队将探针分支统一切换为已在校准片分支验证有效的 RotatedFCOSHead 架构后，指标提升至 F1=0.973，同时训练/推理流程更统一、维护成本更低。
 
 ## 目录结构
 
 ```
-framework/
-├── extractPhysicalFeatures.m     # 手工物理特征提取
-├── buildFusionNetwork.m           # LSTM+注意力+特征融合网络构建
-├── attentionWeightedSum.m         # 注意力加权聚合
-├── modelLoss.m                    # 物理约束损失函数
-├── trainFusionNetwork.m           # 训练脚本
-├── preprocessData.m / formatData.m  # 数据预处理
-└── detectContactPoint.m           # 接触点检测
+.
+├── model.py                       # GSGProbeNet 网络定义（backbone/FPN/各检测头）
+├── train.py                       # 两阶段训练脚本，含损失函数与多任务加权
+├── data_pipeline.py                # 数据增强与合成扰动标签生成
+├── metrics.py                     # 评估指标（mAP/F1/PCK等）
+├── predict.py                     # 推理脚本
+├── scrub_geometry.py               # 针痕分组的纯几何判据
+├── wear_scoring.py                 # 磨损评分（圆拟合/Procrustes/马氏距离）
+├── cv_baseline.py / scrub_cv_baseline.py  # 冷启动伪标签的传统CV基线方案
+├── merge_scrub_pseudo_labels.py    # 伪标签合并工具
+├── export_and_cpp_interface.py     # ONNX导出与C++部署接口
+└── dataset_config.json             # 数据集配置
 ```
 
 ## 技术栈
 
-`MATLAB` · `Deep Learning Toolbox` · `LSTM` · `Attention Mechanism`
+`Python` · `PyTorch` · `HRNet` · `FCOS` · `OpenCV` · `ONNX` · `C++` (部署) · `Qt` (上位机界面)
 
----
-
-> 本仓库为课题组内相关研究方向的技术记录与代码整理，物理约束项的具体形式可根据实际应用场景中的先验知识灵活扩展。
+> 本仓库为课题组内相关研究方向的技术记录与代码整理，部分模块为团队协作成果，具体分工请参考项目说明文档。
